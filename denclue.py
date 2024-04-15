@@ -2,10 +2,14 @@
 denclue.py
 
 @author: mgarrett
+changed by Euan
+main change:  Gaussian to Spherical Kernel Function
+kernelize(x, y, h, degree) = (c_d / vol_b_d) * (np.linalg.norm(x - y) <= h)
 """
 import numpy as np
 from sklearn.base import BaseEstimator, ClusterMixin
 import networkx as nx
+from scipy.special import gamma
 
 def _hill_climb(x_t, X, W=None, h=0.1, eps=1e-7):
     """
@@ -42,23 +46,31 @@ def _hill_climb(x_t, X, W=None, h=0.1, eps=1e-7):
 def _step(x_l0, X, W=None, h=0.1):
     n = X.shape[0]
     d = X.shape[1]
-    superweight = 0. #superweight is the kernel X weight for each item
-    x_l1 = np.zeros((1,d))
+    superweight = 0.
+    x_l1 = np.zeros((1, d))
     if W is None:
-        W = np.ones((n,1))
+        W = np.ones((n, 1))
     else:
         W = W
+
     for j in range(n):
         kernel = kernelize(x_l0, X[j], h, d)
-        kernel = kernel * W[j]/(h**d)
-        superweight = superweight + kernel
-        x_l1 = x_l1 + (kernel * X[j])
-    x_l1 = x_l1/superweight
-    density = superweight/np.sum(W)
+        if kernel > 1e-8:
+            superweight += kernel
+            x_l1 += (kernel * X[j])
+
+    if superweight > 1e-8:
+        x_l1 /= superweight
+    else:
+        x_l1 = x_l0
+
+    density = superweight / np.sum(W)
     return [x_l1, density]
     
 def kernelize(x, y, h, degree):
-    kernel = np.exp(-(np.linalg.norm(x-y)/h)**2./2.)/((2.*np.pi)**(degree/2))
+    c_d = np.pi ** (degree / 2) / gamma(degree / 2 + 1)
+    vol_b_d = h ** degree
+    kernel = (c_d / vol_b_d) * (np.linalg.norm(x - y) <= h)
     return kernel
 
 class DENCLUE(BaseEstimator, ClusterMixin):
@@ -121,85 +133,86 @@ class DENCLUE(BaseEstimator, ClusterMixin):
             raise ValueError("eps must be positive.")
         self.n_samples = X.shape[0]
         self.n_features = X.shape[1]
-        density_attractors = np.zeros((self.n_samples,self.n_features))
-        radii = np.zeros((self.n_samples,1))
-        density = np.zeros((self.n_samples,1))
-        
-        #create default values
+        density_attractors = np.zeros((self.n_samples, self.n_features))
+        radii = np.zeros((self.n_samples, 1))
+        density = np.zeros((self.n_samples, 1))
+
+        # create default values
         if self.h is None:
-            self.h = np.std(X)/5
+            self.h = np.std(X) / 5
         if sample_weight is None:
-            sample_weight = np.ones((self.n_samples,1))
+            sample_weight = np.ones((self.n_samples, 1))
         else:
             sample_weight = sample_weight
-        
-        #initialize all labels to noise
+
+        # initialize all labels to noise
         labels = -np.ones(X.shape[0])
-        
-        #climb each hill
-        for i in range(self.n_samples):
-            density_attractors[i], density[i], radii[i] = _hill_climb(X[i], X, W=sample_weight,
-                                                     h=self.h, eps=self.eps)
-            
-        #initialize cluster graph to finalize clusters. Networkx graph is
-        #used to verify clusters, which are connected components of the
-        #graph. Edges are defined as density attractors being in the same
-        #neighborhood as defined by our radii for each attractor.
+
+        # climb each hill
+        print("Fitting DENCLUE model...")
+        with tqdm(total=self.n_samples, unit="sample") as pbar:
+            for i in range(self.n_samples):
+                try:
+                    density_attractors[i], density[i], radii[i] = _hill_climb(X[i], X, W=sample_weight,
+                                                         h=self.h, eps=self.eps)
+                except ZeroDivisionError:
+                    # Handle potential divide-by-zero errors
+                    density_attractors[i] = X[i]
+                    density[i] = 0.0
+                    radii[i] = 0.0
+                pbar.update(1)
+
+        # initialize cluster graph to finalize clusters. Networkx graph is
+        # used to verify clusters, which are connected components of the
+        # graph. Edges are defined as density attractors being in the same
+        # neighborhood as defined by our radii for each attractor.
         cluster_info = {}
         num_clusters = 0
-        cluster_info[num_clusters]={'instances': [0],
+        cluster_info[num_clusters] = {'instances': [0],
                                     'centroid': np.atleast_2d(density_attractors[0])}
         g_clusters = nx.Graph()
         for j1 in range(self.n_samples):
-            g_clusters.add_node(j1, attr_dict={'attractor':density_attractors[j1], 'radius':radii[j1],
-                                'density':density[j1]})
-                                    
-        #populate cluster graph
-        for j1 in range(self.n_samples):
-            for j2 in (x for x in range(self.n_samples) if x != j1):
-                if g_clusters.has_edge(j1,j2):
-                    continue
-                diff = np.linalg.norm(g_clusters.node[j1]['attractor']-g_clusters.node[j2]['attractor'])
-                if diff <= (g_clusters.node[j1]['radius']+g_clusters.node[j1]['radius']):
-                    g_clusters.add_edge(j1, j2)
-                    
-        #connected components represent a cluster
-        clusters = list(nx.connected_component_subgraphs(g_clusters))
+            g_clusters.add_node(j1, attractor=density_attractors[j1], radius=radii[j1], density=density[j1])
+    
+        # populate cluster graph
+        print("Computing cluster centroids and sample similarities...")
+        with tqdm(total=self.n_samples * (self.n_samples - 1) // 2, unit="edge") as pbar:
+            for j1 in range(self.n_samples):
+                for j2 in (x for x in range(self.n_samples) if x != j1):
+                    if j2 in g_clusters.neighbors(j1):
+                        continue
+                    diff = np.linalg.norm(g_clusters.nodes[j1]['attractor'] - g_clusters.nodes[j2]['attractor'])
+                    if diff <= (g_clusters.nodes[j1]['radius'] + g_clusters.nodes[j1]['radius']):
+                        g_clusters.add_edge(j1, j2)
+                    pbar.update(1)
+    
+       # connected components represent a cluster
+        clusters = [g for g in nx.connected_components(g_clusters)]
         num_clusters = 0
-        
-        #loop through all connected components
-        for clust in clusters:
-            
-            #get maximum density of attractors and location
-            max_instance = max(clust, key=lambda x: clust.node[x]['density'])
-            max_density = clust.node[max_instance]['density']
-            max_centroid = clust.node[max_instance]['attractor']
-            
-           
-            #In Hinneberg, Gabriel (2007), for attractors in a component that
-            #are not fully connected (i.e. not all attractors are within each
-            #other's neighborhood), they recommend re-running the hill climb 
-            #with lower eps. From testing, this seems unnecesarry for all but
-            #special edge cases. Therefore, completeness info is put into 
-            #cluster info dict, but not used to re-run hill climb.
-            complete = False
-            c_size = len(clust.nodes())
-            if clust.number_of_edges() == (c_size*(c_size-1))/2.:
-                complete = True
-            
-            #populate cluster_info dict
-            cluster_info[num_clusters] = {'instances': clust.nodes(),
-                                        'size': c_size,
-                                        'centroid': max_centroid,
-                                        'density': max_density,
-                                        'complete': complete}
-            
-            #if the cluster density is not higher than the minimum,
-            #instances are kept classified as noise
-            if max_density >= self.min_density:
-                labels[clust.nodes()]=num_clusters            
-            num_clusters += 1
-
+    
+        # loop through all connected components
+        print("Finalizing clusters...")
+        with tqdm(total=len(clusters), unit="cluster") as pbar:
+            for clust in clusters:
+                # get maximum density of attractors and location
+                max_instance = max(clust, key=lambda x: g_clusters.nodes[x]['density'])
+                max_density = g_clusters.nodes[max_instance]['density']
+                max_centroid = g_clusters.nodes[max_instance]['attractor']
+    
+                # populate cluster_info dict
+                cluster_info[num_clusters] = {'instances': list(clust),
+                                            'size': len(clust),
+                                            'centroid': max_centroid,
+                                            'density': max_density,
+                                            'complete': g_clusters.subgraph(clust).number_of_edges() == (len(clust) * (len(clust) - 1)) / 2.}
+    
+                # if the cluster density is not higher than the minimum,
+                # instances are kept classified as noise
+                if max_density >= self.min_density:
+                    labels[list(clust)] = num_clusters
+                num_clusters += 1
+                pbar.update(1)
+    
         self.clust_info_ = cluster_info
         self.labels_ = labels
         return self
